@@ -14,24 +14,23 @@
 * Грамотно обрабатывает `Ctrl+C`, не оставляя «битых» файлов;
 * Не требует официального API Яндекса.
 
-## Установка
-
-```bash
-pip install yandex_reviews_parser tqdm colorama
-pip install yandex-reviews-to-md
-````
-
 ## Быстрый старт
 
 ```bash
-# Выгрузка по URL, файл будет создан по умолчанию (reviews_<id>.md)
-yandex-reviews-to-md https://yandex.ru/maps/org/1234567
+# Установка зависимостей
+pip install yandex_reviews_parser tqdm colorama
 
-# То же, но сохраняем в указанный каталог
-yandex-reviews-to-md 1234567 -o ~/Downloads/
+# 1. Выгрузка по URL, файл будет создан по умолчанию (reviews_<id>.md)
+python yandex-reviews-to-md https://yandex.ru/maps/org/1234567
 
-# Тихий режим (без tqdm) + подробное логирование
-yandex-reviews-to-md 1234567 --verbose
+# 2. Выгрузка по ID компании
+python yandex-reviews-to-md 1234567
+
+# 3. То же, но сохраняем в указанный каталог
+python yandex-reviews-to-md 1234567 -o ~/Downloads/
+
+# 4. Тихий режим (без tqdm) + подробное логирование
+python yandex-reviews-to-md 1234567 --verbose
 ```
 
 ## Аргументы CLI
