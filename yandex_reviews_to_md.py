@@ -8,8 +8,8 @@ CLI-утилита для массовой выгрузки отзывов о к
 читаемом формате, снабжая пользователя детальной индикацией прогресса.
 
 Запуск:
-    python yandex_reviews_to_md.py https://yandex.ru/maps/org/1234567 --output reviews.md
-    python yandex_reviews_to_md.py 1234567 --output reviews.md
+    python yandex_reviews_to_md.py https://yandex.ru/maps/org/98363077192 --output reviews.md
+    python yandex_reviews_to_md.py 98363077192 --output reviews.md
 """
 
 from __future__ import annotations
@@ -252,3 +252,4 @@ def main() -> None:  # noqa: C901 – сложность обусловлена 
 # ------------------------------------------------------------------------------
 if __name__ == "__main__":
     main()
+
