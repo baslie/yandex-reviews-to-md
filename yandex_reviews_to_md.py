@@ -99,6 +99,69 @@ def _apply_parser_patch() -> None:
 
 
 _apply_parser_patch()
+
+
+# --- Патч для ошибки Chrome на Windows ----------------------------------------
+def _apply_chrome_patch() -> None:
+    """
+    Исправляет ошибку WinError 6 при закрытии Chrome на Windows.
+
+    При garbage collection вызывается Chrome.__del__, который пытается
+    повторно вызвать quit() после того, как драйвер уже закрыт.
+    """
+    import undetected_chromedriver
+
+    original_del = undetected_chromedriver.Chrome.__del__
+
+    def patched_del(self):
+        try:
+            original_del(self)
+        except OSError:
+            pass  # Игнорируем ошибку неверного дескриптора на Windows
+
+    undetected_chromedriver.Chrome.__del__ = patched_del
+
+
+_apply_chrome_patch()
+
+
+# --- Патч для прогресса парсинга ----------------------------------------------
+# Глобальный callback для отображения прогресса (устанавливается в main)
+_progress_callback = None
+
+
+def _apply_progress_patch() -> None:
+    """
+    Добавляет отображение прогресса при парсинге отзывов.
+
+    Патчит метод Parser.__get_data_reviews() для вызова callback
+    при обработке каждого отзыва.
+    """
+    from selenium.webdriver.common.by import By
+    from yandex_reviews_parser.parsers import Parser
+
+    def _patched_get_data_reviews(self) -> list:
+        reviews = []
+        elements = self.driver.find_elements(
+            By.CLASS_NAME, "business-reviews-card-view__review"
+        )
+        if len(elements) > 1:
+            self._Parser__scroll_to_bottom(elements[-1])
+            elements = self.driver.find_elements(
+                By.CLASS_NAME, "business-reviews-card-view__review"
+            )
+
+        total = len(elements)
+        for idx, elem in enumerate(elements, 1):
+            reviews.append(self._Parser__get_data_item(elem))
+            if _progress_callback:
+                _progress_callback(idx, total)
+        return reviews
+
+    Parser._Parser__get_data_reviews = _patched_get_data_reviews
+
+
+_apply_progress_patch()
 # ------------------------------------------------------------------------------
 
 
@@ -117,7 +180,7 @@ except ModuleNotFoundError:  # pragma: no cover
 # ------------------------------------------------------------------------------
 
 __all__ = ["main"]
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 # Символы для спиннера (ASCII-совместимые для Windows)
 _SPINNER_FRAMES: str = "|/-\\"
@@ -292,24 +355,89 @@ def main() -> None:  # noqa: C901 – сложность обусловлена 
     yp = YandexParser(company_id)
 
     # --- Парсинг ---------------------------------------------------------------
-    stop_event = threading.Event()
-    spinner_thread = threading.Thread(
+    global _progress_callback
+
+    # Создаём прогресс-бар (если tqdm доступен)
+    pbar = None
+    stop_event = None
+    spinner_thread = None
+
+    # Спиннер для этапа запуска браузера и загрузки страницы
+    startup_stop_event = threading.Event()
+    startup_spinner_thread = threading.Thread(
         target=show_spinner,
-        args=("  + Идёт парсинг...", stop_event),
+        args=("Запуск браузера и загрузка страницы", startup_stop_event),
         daemon=True,
     )
+    startup_spinner_thread.start()
+    startup_spinner_stopped = False
+
+    if tqdm:
+        # pbar создаётся лениво — только после остановки спиннера
+        def on_progress(current: int, total: int) -> None:
+            nonlocal startup_spinner_stopped, pbar
+            # Останавливаем спиннер запуска при первом отзыве
+            if not startup_spinner_stopped:
+                startup_spinner_stopped = True
+                startup_stop_event.set()
+                startup_spinner_thread.join()
+                # Создаём прогресс-бар только сейчас
+                pbar = tqdm(total=total, desc="Парсинг отзывов", unit="отзыв", ncols=80)
+
+            if pbar.total != total:
+                pbar.total = total
+                pbar.refresh()
+            pbar.n = current
+            pbar.refresh()
+
+        _progress_callback = on_progress
+    else:
+        # Fallback: показываем спиннер если tqdm недоступен
+        # Спиннер запуска уже работает, переключим текст при первом отзыве
+        stop_event = threading.Event()
+
+        def on_progress_fallback(current: int, total: int) -> None:
+            nonlocal startup_spinner_stopped, spinner_thread
+            if not startup_spinner_stopped:
+                startup_spinner_stopped = True
+                startup_stop_event.set()
+                startup_spinner_thread.join()
+                # Запускаем спиннер парсинга
+                spinner_thread = threading.Thread(
+                    target=show_spinner,
+                    args=("  + Идёт парсинг...", stop_event),
+                    daemon=True,
+                )
+                spinner_thread.start()
+
+        _progress_callback = on_progress_fallback
+
     start_ts = time.perf_counter()
-    spinner_thread.start()
 
     try:
         data = yp.parse()
     except KeyboardInterrupt:  # graceful shutdown
-        stop_event.set()
-        spinner_thread.join()
+        # Останавливаем спиннер запуска, если ещё работает
+        if not startup_spinner_stopped:
+            startup_stop_event.set()
+            startup_spinner_thread.join()
+        if pbar:
+            pbar.close()
+        elif stop_event and spinner_thread:
+            stop_event.set()
+            spinner_thread.join()
         sys.exit("\n[-] Операция прервана пользователем (Ctrl+C)")
     finally:
-        stop_event.set()
-        spinner_thread.join()
+        _progress_callback = None
+        # Останавливаем спиннер запуска, если ещё работает
+        if not startup_spinner_stopped:
+            startup_stop_event.set()
+            startup_spinner_thread.join()
+        if pbar:
+            pbar.close()
+        elif stop_event and spinner_thread:
+            stop_event.set()
+            spinner_thread.join()
 
     elapsed = time.perf_counter() - start_ts
     count_reviews = len(data["company_reviews"])
