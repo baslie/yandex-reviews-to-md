@@ -27,6 +27,81 @@ from typing import Any, Dict, List
 
 from yandex_reviews_parser.utils import YandexParser
 
+
+# --- Патч для устаревшей библиотеки yandex_reviews_parser ---------------------
+def _apply_parser_patch() -> None:
+    """
+    Исправляет устаревшие CSS-селекторы в библиотеке yandex_reviews_parser.
+
+    Библиотека не обновлялась с 2023 года, а Яндекс изменил вёрстку страницы.
+    Этот патч автоматически применяется при запуске скрипта.
+    """
+    from dataclasses import asdict
+    from selenium.webdriver.common.by import By
+    from selenium.common.exceptions import NoSuchElementException
+    from yandex_reviews_parser.parsers import Parser
+    from yandex_reviews_parser.helpers import ParserHelper
+    from yandex_reviews_parser.storage import Review
+
+    def _patched_get_data_item(self, elem):
+        """Исправленная версия метода __get_data_item с актуальными селекторами."""
+        try:
+            name = elem.find_element(By.XPATH, ".//span[@itemprop='name']").text
+        except NoSuchElementException:
+            name = None
+
+        try:
+            icon_href = elem.find_element(By.XPATH, ".//div[@class='user-icon-view__icon']").get_attribute('style')
+            icon_href = icon_href.split('"')[1]
+        except NoSuchElementException:
+            icon_href = None
+
+        try:
+            date = elem.find_element(By.XPATH, ".//meta[@itemprop='datePublished']").get_attribute('content')
+        except NoSuchElementException:
+            date = None
+
+        # ИСПРАВЛЕНО: новый селектор для текста отзыва
+        try:
+            text = elem.find_element(By.XPATH, ".//*[contains(@class, 'business-review-view__body')]").text
+        except NoSuchElementException:
+            text = None
+
+        # ИСПРАВЛЕНО: используем meta itemprop вместо подсчёта span
+        try:
+            rating_meta = elem.find_element(By.XPATH, ".//meta[@itemprop='ratingValue']")
+            stars = int(float(rating_meta.get_attribute('content')))
+        except NoSuchElementException:
+            stars = 0
+
+        try:
+            answer = elem.find_element(By.CLASS_NAME, "business-review-view__comment-expand")
+            if answer:
+                self.driver.execute_script("arguments[0].click()", answer)
+                answer = elem.find_element(By.CLASS_NAME, "business-review-comment-content__bubble").text
+            else:
+                answer = None
+        except NoSuchElementException:
+            answer = None
+
+        item = Review(
+            name=name,
+            icon_href=icon_href,
+            date=ParserHelper.form_date(date),
+            text=text,
+            stars=stars,
+            answer=answer
+        )
+        return asdict(item)
+
+    # Применяем патч: заменяем приватный метод класса
+    Parser._Parser__get_data_item = _patched_get_data_item
+
+
+_apply_parser_patch()
+# ------------------------------------------------------------------------------
+
+
 # --- Опциональные зависимости -------------------------------------------------
 try:
     from colorama import just_fix_windows_console  # type: ignore
@@ -44,8 +119,8 @@ except ModuleNotFoundError:  # pragma: no cover
 __all__ = ["main"]
 __version__ = "0.2.0"
 
-# Символы для «танцующего» спиннера (braille)
-_SPINNER_FRAMES: str = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+# Символы для спиннера (ASCII-совместимые для Windows)
+_SPINNER_FRAMES: str = "|/-\\"
 
 
 # ------------------------- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ----------------------------
@@ -65,7 +140,7 @@ def extract_id(source: str) -> int:
     if source.isdigit():
         return int(source)
 
-    match = re.search(r"/(\d{6,})/", source)
+    match = re.search(r"/(\d{6,})(?:/|\?|$)", source)
     if match:
         return int(match.group(1))
 
@@ -113,9 +188,8 @@ def build_markdown(data: Dict[str, Any], verbose: bool = False) -> str:
     # Шапка
     md.append(f"# {company['name']}\n")
     md.append(
-        f"**Рейтинг:** {company['rating']} ⭐  \n"
-        f"**Всего голосов:** {company['count_rating']}  \n"
-        f"**Звёзд на Яндекс.Картах:** {company['stars']}/5\n"
+        f"**Рейтинг:** {company['rating']}/5  \n"
+        f"**Всего голосов:** {company['count_rating']}\n"
     )
     md.append("\n---\n")
     md.append("## Отзывы\n")
@@ -140,7 +214,7 @@ def build_markdown(data: Dict[str, Any], verbose: bool = False) -> str:
         date_str = datetime.fromtimestamp(review["date"]).strftime("%d.%m.%Y")
         md.append(f"### {idx}. {review['name']} — {date_str}")
         md.append(f"**Оценка:** {review['stars']}/5\n")
-        md.append(review["text"].strip() or "_(текст отсутствует)_")
+        md.append((review.get("text") or "").strip() or "_(текст отсутствует)_")
         if answer := review.get("answer"):
             md.append(f"\n> **Ответ компании:** {answer.strip()}")
         md.append("\n---\n")
@@ -246,7 +320,7 @@ def main() -> None:  # noqa: C901 – сложность обусловлена 
     output_path = _validate_output(args.output, company_id)
     output_path.write_text(md_text, encoding="utf-8")
 
-    print(f"[+] Markdown сохранён ➜ {output_path}")
+    print(f"[+] Markdown сохранён: {output_path}")
 
 
 # ------------------------------------------------------------------------------
