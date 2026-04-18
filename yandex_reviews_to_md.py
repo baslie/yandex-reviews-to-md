@@ -15,64 +15,124 @@ CLI-утилита для массовой выгрузки отзывов о к
 from __future__ import annotations
 
 import argparse
+import hashlib
 import itertools
 import logging
+import mimetypes
 import re
 import sys
 import threading
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Callable, Dict, List, Optional
 
 from yandex_reviews_parser.utils import YandexParser
+
+
+# --- Утилиты для работы с медиа (используются внутри патчей парсера) -----------
+_BG_URL_RE = re.compile(r'url\((?:"|\')?(?P<url>[^"\')]+)(?:"|\')?\)')
+
+
+def _extract_bg_url(style: Optional[str]) -> Optional[str]:
+    """Извлекает URL из inline-style `background-image: url("…")`."""
+    if not style:
+        return None
+    match = _BG_URL_RE.search(style)
+    return match.group("url") if match else None
+
+
+def _upscale_yandex_photo(url: str) -> str:
+    """
+    Меняет размерный суффикс Яндекс-CDN на `orig`, чтобы получить оригинал.
+
+    Примеры:
+        .../get-altay/16323929/.../S       → .../get-altay/16323929/.../orig
+        .../get-yapic/68143/0y-8/islands-68 → без изменений (формат аватара)
+    """
+    if not url:
+        return url
+    return re.sub(r'/(?:XXL|XL|L|M|S|orig)(?=(?:\?|$))', '/orig', url)
 
 
 # --- Патч для устаревшей библиотеки yandex_reviews_parser ---------------------
 def _apply_parser_patch() -> None:
     """
-    Исправляет устаревшие CSS-селекторы в библиотеке yandex_reviews_parser.
+    Исправляет устаревшие CSS-селекторы в библиотеке yandex_reviews_parser
+    и расширяет набор извлекаемых полей (фото, полный текст).
 
     Библиотека не обновлялась с 2023 года, а Яндекс изменил вёрстку страницы.
     Этот патч автоматически применяется при запуске скрипта.
     """
-    from dataclasses import asdict
     from selenium.webdriver.common.by import By
     from selenium.common.exceptions import NoSuchElementException
     from yandex_reviews_parser.parsers import Parser
     from yandex_reviews_parser.helpers import ParserHelper
-    from yandex_reviews_parser.storage import Review
 
     def _patched_get_data_item(self, elem):
-        """Исправленная версия метода __get_data_item с актуальными селекторами."""
+        """Возвращает расширенный словарь с данными отзыва."""
         try:
             name = elem.find_element(By.XPATH, ".//span[@itemprop='name']").text
         except NoSuchElementException:
             name = None
 
         try:
-            icon_href = elem.find_element(By.XPATH, ".//div[@class='user-icon-view__icon']").get_attribute('style')
-            icon_href = icon_href.split('"')[1]
+            icon_style = elem.find_element(
+                By.XPATH, ".//div[@class='user-icon-view__icon']"
+            ).get_attribute('style')
+            icon_href = _extract_bg_url(icon_style)
         except NoSuchElementException:
             icon_href = None
 
         try:
-            date = elem.find_element(By.XPATH, ".//meta[@itemprop='datePublished']").get_attribute('content')
+            date = elem.find_element(
+                By.XPATH, ".//meta[@itemprop='datePublished']"
+            ).get_attribute('content')
         except NoSuchElementException:
             date = None
 
-        # ИСПРАВЛЕНО: новый селектор для текста отзыва
+        # Раскрываем длинный текст: кликаем по кнопке «Ещё» внутри спойлера.
         try:
-            text = elem.find_element(By.XPATH, ".//*[contains(@class, 'business-review-view__body')]").text
+            expand_btn = elem.find_element(
+                By.CLASS_NAME, "business-review-view__expand"
+            )
+            self.driver.execute_script("arguments[0].click()", expand_btn)
+            time.sleep(0.1)
+        except NoSuchElementException:
+            pass
+
+        try:
+            text = elem.find_element(
+                By.XPATH, ".//*[contains(@class, 'business-review-view__body')]"
+            ).text
         except NoSuchElementException:
             text = None
 
-        # ИСПРАВЛЕНО: используем meta itemprop вместо подсчёта span
+        # Оценка: meta itemprop надёжнее подсчёта заполненных звёзд.
         try:
-            rating_meta = elem.find_element(By.XPATH, ".//meta[@itemprop='ratingValue']")
+            rating_meta = elem.find_element(
+                By.XPATH, ".//meta[@itemprop='ratingValue']"
+            )
             stars = int(float(rating_meta.get_attribute('content')))
         except NoSuchElementException:
             stars = 0
+
+        # Фото, прикреплённые к отзыву. URL заканчивается размером (напр. `/S`);
+        # меняем на `/orig` для оригинала.
+        photos: List[str] = []
+        try:
+            photo_imgs = elem.find_elements(
+                By.CSS_SELECTOR, "img.business-review-media__item-img"
+            )
+            for img in photo_imgs:
+                src = img.get_attribute("src")
+                if src:
+                    photos.append(_upscale_yandex_photo(src))
+        except NoSuchElementException:
+            pass
 
         try:
             answer = elem.find_element(By.CLASS_NAME, "business-review-view__comment-expand")
@@ -84,15 +144,15 @@ def _apply_parser_patch() -> None:
         except NoSuchElementException:
             answer = None
 
-        item = Review(
-            name=name,
-            icon_href=icon_href,
-            date=ParserHelper.form_date(date),
-            text=text,
-            stars=stars,
-            answer=answer
-        )
-        return asdict(item)
+        return {
+            "name": name,
+            "icon_href": icon_href,
+            "date": ParserHelper.form_date(date),
+            "text": text,
+            "stars": stars,
+            "answer": answer,
+            "photos": photos,
+        }
 
     # Применяем патч: заменяем приватный метод класса
     Parser._Parser__get_data_item = _patched_get_data_item
@@ -232,19 +292,115 @@ def show_spinner(prefix: str, stop_event: threading.Event) -> None:
     sys.stdout.flush()
 
 
-def build_markdown(data: Dict[str, Any], verbose: bool = False) -> str:
+_SORT_KEYS = ("date-new", "date-old", "rating-high", "rating-low")
+
+
+def _sort_reviews(reviews: List[Dict[str, Any]], sort_key: str) -> List[Dict[str, Any]]:
+    """Возвращает копию списка отзывов, отсортированную по выбранному ключу."""
+    date_of = lambda r: r.get("date") or 0
+    stars_of = lambda r: r.get("stars") or 0
+
+    if sort_key == "date-new":
+        return sorted(reviews, key=date_of, reverse=True)
+    if sort_key == "date-old":
+        return sorted(reviews, key=date_of)
+    if sort_key == "rating-high":
+        return sorted(reviews, key=lambda r: (stars_of(r), date_of(r)), reverse=True)
+    if sort_key == "rating-low":
+        return sorted(reviews, key=lambda r: (stars_of(r), -date_of(r)))
+    return list(reviews)
+
+
+_DEFAULT_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/124.0.0.0 Safari/537.36"
+)
+
+
+def _download_media(url: str, dest_dir: Path, throttle: float = 0.05) -> Optional[Path]:
+    """
+    Скачивает файл по URL в `dest_dir`. Имя файла — `sha1(url)[:12].ext`.
+
+    Возвращает путь к файлу (при успехе) или None (при ошибке).
+    Повторный вызов для уже скачанного URL пропускает сетевой запрос.
+    """
+    if not url:
+        return None
+
+    digest = hashlib.sha1(url.encode("utf-8")).hexdigest()[:12]
+
+    # Пытаемся угадать расширение по URL (до Content-Type).
+    ext = ""
+    path_part = urllib.parse.urlparse(url).path
+    if "." in path_part.rsplit("/", 1)[-1]:
+        ext = "." + path_part.rsplit(".", 1)[-1].lower()
+        if len(ext) > 5:
+            ext = ""
+
+    # Если уже есть файл с таким hash-префиксом — переиспользуем.
+    existing = next((p for p in dest_dir.glob(f"{digest}.*")), None)
+    if existing:
+        return existing
+
+    req = urllib.request.Request(url, headers={"User-Agent": _DEFAULT_UA})
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            data = resp.read()
+            if not ext:
+                ctype = resp.headers.get("Content-Type", "").split(";")[0].strip()
+                guessed = mimetypes.guess_extension(ctype) or ""
+                ext = guessed or ".jpg"
+    except (urllib.error.URLError, TimeoutError, ConnectionError) as exc:
+        logging.warning("Не удалось скачать %s: %s", url, exc)
+        return None
+
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    file_path = dest_dir / f"{digest}{ext}"
+    file_path.write_bytes(data)
+    time.sleep(throttle)
+    return file_path
+
+
+def build_markdown(
+    data: Dict[str, Any],
+    *,
+    sort_key: str = "date-new",
+    media_dir: Optional[Path] = None,
+    md_path: Optional[Path] = None,
+    download: bool = True,
+    verbose: bool = False,
+) -> str:
     """
     Преобразует сырые данные парсера в Markdown-текст.
 
     Args:
         data: Результат `YandexParser.parse()`.
+        sort_key: Одно из значений `_SORT_KEYS`.
+        media_dir: Каталог для скачанных медиа (рядом с `md_path`).
+        md_path: Путь к итоговому .md — чтобы строить относительные ссылки.
+        download: Скачивать ли медиа локально.
         verbose: Выводить ли прогресс в консоль.
 
     Returns:
         Готовый Markdown.
     """
     company: Dict[str, Any] = data["company_info"]
-    reviews: List[Dict[str, Any]] = data["company_reviews"]
+    reviews: List[Dict[str, Any]] = _sort_reviews(data["company_reviews"], sort_key)
+
+    if download and media_dir is not None:
+        avatars_dir = media_dir / "avatars"
+        photos_dir = media_dir / "photos"
+    else:
+        avatars_dir = photos_dir = None
+
+    def _relative(p: Path) -> str:
+        if md_path is None:
+            return str(p)
+        try:
+            return p.relative_to(md_path.parent).as_posix()
+        except ValueError:
+            return p.as_posix()
 
     md: List[str] = []
 
@@ -252,7 +408,8 @@ def build_markdown(data: Dict[str, Any], verbose: bool = False) -> str:
     md.append(f"# {company['name']}\n")
     md.append(
         f"**Рейтинг:** {company['rating']}/5  \n"
-        f"**Всего голосов:** {company['count_rating']}\n"
+        f"**Всего голосов:** {company['count_rating']}  \n"
+        f"**Сортировка:** {sort_key}\n"
     )
     md.append("\n---\n")
     md.append("## Отзывы\n")
@@ -275,9 +432,50 @@ def build_markdown(data: Dict[str, Any], verbose: bool = False) -> str:
             logging.info("  ...сформировано %s/%s", idx, len(reviews))
 
         date_str = datetime.fromtimestamp(review["date"]).strftime("%d.%m.%Y")
-        md.append(f"### {idx}. {review['name']} — {date_str}")
+
+        # Аватар: inline-миниатюра перед именем.
+        icon_href = review.get("icon_href")
+        avatar_md = ""
+        if icon_href:
+            if download and avatars_dir is not None:
+                local = _download_media(icon_href, avatars_dir)
+                if local is not None:
+                    avatar_md = f"![аватар]({_relative(local)}) "
+                else:
+                    avatar_md = f"![аватар]({icon_href}) "
+            else:
+                avatar_md = f"![аватар]({icon_href}) "
+
+        md.append(f"### {idx}. {avatar_md}{review['name']} — {date_str}")
         md.append(f"**Оценка:** {review['stars']}/5\n")
         md.append((review.get("text") or "").strip() or "_(текст отсутствует)_")
+
+        # Фото, прикреплённые к отзыву.
+        photos = review.get("photos") or []
+        photo_lines: List[str] = []
+        local_photo_paths: List[Optional[Path]] = []
+        if photos:
+            md.append("\n**Фото:**")
+            for url in photos:
+                local: Optional[Path] = None
+                if download and photos_dir is not None:
+                    local = _download_media(url, photos_dir)
+                local_photo_paths.append(local)
+                if local is not None:
+                    photo_lines.append(f"![]({_relative(local)})")
+                else:
+                    photo_lines.append(f"![]({url})")
+            md.extend(photo_lines)
+
+        # HTML-комментарий с оригинальными URL — для отладки и архивации.
+        comment_parts: List[str] = []
+        if icon_href:
+            comment_parts.append(f"  - {icon_href} (аватар)")
+        for i, url in enumerate(photos, 1):
+            comment_parts.append(f"  - {url} (фото {i})")
+        if comment_parts:
+            md.append("\n<!-- оригиналы:\n" + "\n".join(comment_parts) + "\n-->")
+
         if answer := review.get("answer"):
             md.append(f"\n> **Ответ компании:** {answer.strip()}")
         md.append("\n---\n")
@@ -334,6 +532,23 @@ def main() -> None:  # noqa: C901 – сложность обусловлена 
     )
     argp.add_argument("input", nargs="?", help="URL с отзывами или ID компании")
     argp.add_argument("-o", "--output", help="Файл назначения (.md или каталог)")
+    argp.add_argument(
+        "-s",
+        "--sort",
+        choices=_SORT_KEYS,
+        default="date-new",
+        help="Сортировка отзывов (по умолчанию: date-new)",
+    )
+    argp.add_argument(
+        "--no-download-media",
+        action="store_true",
+        help="Не скачивать фото и аватары локально — только URL в Markdown",
+    )
+    argp.add_argument(
+        "--media-subdir",
+        default=None,
+        help="Имя подкаталога для медиа (по умолчанию: <имя-md>_media)",
+    )
     argp.add_argument(
         "-v",
         "--verbose",
@@ -444,11 +659,27 @@ def main() -> None:  # noqa: C901 – сложность обусловлена 
     logging.info("Скачано отзывов: %s (время: %.1f с)", count_reviews, elapsed)
 
     # --- Форматирование --------------------------------------------------------
-    md_text = build_markdown(data, verbose=args.verbose)
     output_path = _validate_output(args.output, company_id)
+
+    download_media = not args.no_download_media
+    subdir_name = args.media_subdir or f"{output_path.stem}_media"
+    media_dir = output_path.parent / subdir_name if download_media else None
+
+    md_text = build_markdown(
+        data,
+        sort_key=args.sort,
+        media_dir=media_dir,
+        md_path=output_path,
+        download=download_media,
+        verbose=args.verbose,
+    )
     output_path.write_text(md_text, encoding="utf-8")
 
-    print(f"[+] Markdown сохранён: {output_path}")
+    if download_media and media_dir is not None:
+        print(f"[+] Markdown сохранён: {output_path}")
+        print(f"[+] Медиа: {media_dir}")
+    else:
+        print(f"[+] Markdown сохранён: {output_path}")
 
 
 # ------------------------------------------------------------------------------
