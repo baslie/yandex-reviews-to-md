@@ -5,7 +5,7 @@
 ![python](https://img.shields.io/badge/python-3.8%2B-blue)
 ![license](https://img.shields.io/github/license/baslie/yandex-reviews-to-md)
 
-> **Последняя проверка работоспособности:** 30 ноября 2025, 12:20 МСК
+> **Последняя проверка работоспособности:** 18 апреля 2026 года
 
 ## Возможности
 
@@ -58,6 +58,17 @@ python yandex_reviews_to_md.py 44307431220 --sort date-old
 # 7. Без локального скачивания медиа (только URL в MD)
 python yandex_reviews_to_md.py 44307431220 --no-download-media
 ```
+
+### Через Claude Code (skill)
+
+В репозитории лежит локальный скилл `collect-yandex-reviews` (`.claude/skills/collect-yandex-reviews/SKILL.md`). Он автоматически подхватывается Claude Code при запуске из корня репозитория и упрощает работу:
+
+* проверяет окружение (Python, `yandex_reviews_parser`, `tqdm`, `colorama`, `selenium`, Chrome) и подсказывает команду установки, если чего-то не хватает;
+* ведёт по короткой викторине: URL/ID → сортировка → скачивать ли медиа → куда сохранить;
+* поддерживает **несколько компаний за одну сессию** — после каждой выгрузки спрашивает, добавить ли следующую;
+* в конце выводит сводную таблицу со всеми обработанными организациями.
+
+Триггеры: «собери отзывы», «выгрузи отзывы», «спарси компанию», прямая ссылка `yandex.ru/profile/...` или `yandex.ru/maps/org/...`. Скилл работает только в этом репозитории — глобально его ставить не нужно.
 
 ## Поддерживаемые форматы URL
 
@@ -120,7 +131,11 @@ yandex-reviews-to-md/
 ├── yandex_reviews_to_md.py   # Основной скрипт
 ├── run.bat                   # Запуск для Windows
 ├── README.md
-└── LICENSE
+├── LICENSE
+└── .claude/
+    └── skills/
+        └── collect-yandex-reviews/
+            └── SKILL.md      # Локальный скилл Claude Code
 ```
 
 ## Ограничения
